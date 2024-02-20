@@ -1,14 +1,4 @@
-import logging,aiomysql
-import asyncio,os,json,time
-from datetime import datetime
-import sys
-import traceback
-
-from aiohttp import web
-from jinja2 import Environment,FileSystemLoader
-from coroweb import add_routes, add_static
-from orm import Model,StringField,IntegerField,create_pool,execute,select
-
+import logging
 logging.basicConfig(level=logging.DEBUG,  # 设置全局日志级别
                     format='%(filename)s %(lineno)d  %(funcName)s %(asctime)s %(levelname)s: %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
@@ -16,76 +6,19 @@ logging.basicConfig(level=logging.DEBUG,  # 设置全局日志级别
                     filemode='a',  # 文件打开模式，'w'为覆盖写入，'a'为追加写入
                     encoding='utf-8'
                    )
+import asyncio,os,json,time
+from datetime import datetime
+from aiohttp import web
+from jinja2 import Environment,FileSystemLoader
+from coroweb import add_routes, add_static
+from orm import create_pool
+from handlers import COOKIE_NAME,cookie2user
+from config import configs
+
+
 
 #全局定義變量
 db_pool = None
-
-class Sites(Model):
-    id = IntegerField(primary_key=True)
-    name = StringField()
-    url = StringField()
-
-async def site(request):
-    get_params = request.rel_url.query
-    id = get_params.get('id')
-    rs = await Sites.find(id);
-    return web.Response(text=str(rs), content_type='text/html')
-
-async def addSite(request):
-    m = Sites()
-    m.name = 'meizhu'
-    m.url = 'https://www.meizhu.com'
-    rs = await m.save()
-    return web.Response(text=str(rs), content_type='text/html')
-
-async def updateSite(request):
-    m = Sites()
-    m.id = 12
-    m.name = 'meizhu'
-    m.url = 'https://www.meizhu.com/12'
-    rs = await m.update()
-    return web.Response(text=str(rs), content_type='text/html')
-
-async def delSite(request):
-    get_params = request.rel_url.query
-    id = get_params.get('id')
-    m = Sites()
-    m.id = id
-    rs = await m.remove()
-    return web.Response(text=str(rs), content_type='text/html')
-
-async def test(request):
-   return web.Response(text='<h1>test</h1>', content_type='text/html')
-
-
-
-async def add(request):
-    # 獲取get數據
-    get_params = request.rel_url.query
-    name = get_params.get('name')
-    url = get_params.get('url')
-
-    # 获取POST表单数据
-    # post_data = await request.post()
-    # param_value = post_data.get('param_name')
-
-    # 如果Content-Type是application/json，则可以这样获取数据
-    if 'content-type' in request.headers and request.headers['content-type'] == 'application/json':
-        post_data = await request.json()
-        # 获取名为'param_name'的对象属性或键值
-        param_value = post_data.get('param_name')
-
-    sql = 'INSERT INTO `python`.`sites` (`name`, `url`) VALUES (?,?)'
-    args = (name,url)
-    affected = await execute(sql,args)
-    return web.Response(text=str(affected), content_type='text/html')
- 
-async def index(request):
-    rows = await select("SELECT * FROM sites")
-    html = "<h1>Index</h1>"
-    for row in rows:
-        html += f"<p>{row}</p>"
-    return web.Response(text=html, content_type='text/html')
 
 #初始化jinja2模板引擎
 def init_jinja2(app,**kw):
@@ -107,7 +40,7 @@ def init_jinja2(app,**kw):
     if filters is not None:
         for name,f in filters.items():
             env.filters[name] = f
-    app['__temlating__'] = env
+    app['__templating__'] = env
 
 #日誌中間件
 async def logger_factory(app,handler):
@@ -129,48 +62,57 @@ async def data_factory(app,handler):
         return await handler(request)
     return parse_data
 
+async def auth_factory(app, handler):
+    async def auth(request):
+        logging.info('check user: %s %s' % (request.method, request.path))
+        request.__user__ = None
+        cookie_str = request.cookies.get(COOKIE_NAME)
+        if cookie_str:
+            user = await cookie2user(cookie_str)
+            if user:
+                logging.info('set current user: %s' % user.email)
+                request.__user__ = user
+        if request.path.startswith('/manage/') and (request.__user__ is None or not request.__user__.admin):
+            return web.HTTPFound('/signin')
+        return await handler(request)
+    return auth
+
 #响应中间件
-async def response_factory(app,handler):
+async def response_factory(app, handler):
     async def response(request):
-        logging.info('Resonse handler...')
-        try:
-            logging.info( handler)
-            r = await handler(request)
-        except Exception as e:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            logging.error(f"Error occurred in handler: {str(e)}")
-            logging.error("Traceback:")
-            logging.error("\n".join(traceback.format_tb(exc_traceback)))
-            return web.Response(status=500)
-        logging.info('r:%s' % str(r))
-        if isinstance(r,web.StreamResponse):
+        logging.info('Response handler...')
+        r = await handler(request)
+        if isinstance(r, web.StreamResponse):
             return r
-        if isinstance(r,bytes):
+        if isinstance(r, bytes):
             resp = web.Response(body=r)
-            resp.content_type = 'application/octect-stream'
+            resp.content_type = 'application/octet-stream'
             return resp
-        if isinstance(r,str):
+        if isinstance(r, str):
             if r.startswith('redirect:'):
                 return web.HTTPFound(r[9:])
-            resp = web.Response(body = r.encode('utf-8'))
+            resp = web.Response(body=r.encode('utf-8'))
             resp.content_type = 'text/html;charset=utf-8'
             return resp
-        if isinstance(r,dict):
+        if isinstance(r, dict):
             template = r.get('__template__')
             if template is None:
-                resp = web.Response(body=json.dumps(r,ensure_ascii=False,default=lambda o:o.__dict__).encode('utf-8'))
+                resp = web.Response(body=json.dumps(r, ensure_ascii=False, default=lambda o: o.__dict__).encode('utf-8'))
                 resp.content_type = 'application/json;charset=utf-8'
                 return resp
             else:
+                if request.__user__:
+                    r['__user__'] = request.__user__
                 resp = web.Response(body=app['__templating__'].get_template(template).render(**r).encode('utf-8'))
                 resp.content_type = 'text/html;charset=utf-8'
                 return resp
-        if isinstance(r,int) and r >=100 and r < 600:
+        if isinstance(r, int) and r >= 100 and r < 600:
             return web.Response(r)
-        if isinstance(r,tuple) and len(r) ==2:
-            t,m = r
-            if isinstance(t,int) and t>=100 and t<600:
-                return web.Response(t,str(m))
+        if isinstance(r, tuple) and len(r) == 2:
+            t, m = r
+            if isinstance(t, int) and t >= 100 and t < 600:
+                return web.Response(t, str(m))
+        # default:
         resp = web.Response(body=str(r).encode('utf-8'))
         resp.content_type = 'text/plain;charset=utf-8'
         return resp
@@ -193,20 +135,14 @@ def datetime_filter(t):
 #web框架初始化
 async def init():
     global db_pool
-    app = web.Application(middlewares=[logger_factory,response_factory])
+    app = web.Application()
+    app.middlewares.append(logger_factory)
+    app.middlewares.append(auth_factory)
+    app.middlewares.append(response_factory)
     init_jinja2(app,filters=dict(datetime=datetime_filter))
-
     add_routes(app, 'handlers')
     add_static(app)
-
-    # app.router.add_route('GET', '/', index)
-    # app.router.add_route('GET', '/test', test)
-    # app.router.add_route('GET', '/add', add)
-    # app.router.add_route('GET', '/site', site)
-    # app.router.add_route('GET', '/addsite', addSite)
-    # app.router.add_route('GET', '/updateSite', updateSite)
-    app.router.add_route('GET', '/delsite', delSite)
-    db_pool =await create_pool(loop=asyncio.get_event_loop(), user='python', password='python', db="python")
+    db_pool =await create_pool(loop=asyncio.get_event_loop(), user=configs.db.user, password=configs.db.password, db=configs.db.db)
     app['db_pool'] =db_pool
     return app
 
